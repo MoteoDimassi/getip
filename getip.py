@@ -9,6 +9,7 @@
   getip -A Claude        отслеживать соединения программы (без DNS и без sudo)
 """
 import argparse
+import ast
 import atexit
 import ipaddress
 import json
@@ -30,7 +31,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 CONFIG_PATH = os.path.expanduser("~/.config/getip/config.json")
 DEFAULTS = {"gw": "0.0.0.0", "persistent": False, "exact": False,
             "out_dir": "", "deep_seconds": 60, "last_domain": ""}
@@ -180,27 +181,35 @@ def menu(title, items, body="", index=0, footer="↑↓ выбор · → или
     Возвращает индекс пункта или None."""
     cursor(False)
     notice = ""
+    shown = None
+    # если пункты или текст вычисляются на лету, раз в полсекунды проверяем, не изменились ли они
+    dynamic = callable(items) or callable(body)
     while True:
         rows = items() if callable(items) else items
         text_body = body() if callable(body) else body
-        width = max(len(label) for label, _ in rows)
-        header(title)
-        if text_body:
-            out(text_body.rstrip("\n") + "\n\n")
-        for i, (label, hint) in enumerate(rows):
-            text = label.ljust(width)
-            if i == index:
-                out(f"  {cyan('❯')} {bold(cyan(text))}")
-            else:
-                out(f"    {text}")
-            out(f"   {dim(hint)}\n" if hint else "\n")
-        if notice:
-            out("\n  " + notice + "\n")
         text_details = details(index) if details else ""
-        if text_details:
-            out("\n  " + dim("─" * min(80, term_width() - 4)) + "\n" + text_details.rstrip("\n") + "\n")
-        out("\n  " + dim(footer) + "\n")
-        key = read_key()
+        frame = (tuple(rows), text_body, index, notice, text_details)
+        if frame != shown:
+            shown = frame
+            width = max(len(label) for label, _ in rows)
+            header(title)
+            if text_body:
+                out(text_body.rstrip("\n") + "\n\n")
+            for i, (label, hint) in enumerate(rows):
+                text = label.ljust(width)
+                if i == index:
+                    out(f"  {cyan('❯')} {bold(cyan(text))}")
+                else:
+                    out(f"    {text}")
+                out(f"   {dim(hint)}\n" if hint else "\n")
+            if notice:
+                out("\n  " + notice + "\n")
+            if text_details:
+                out("\n  " + dim("─" * min(80, term_width() - 4)) + "\n" + text_details.rstrip("\n") + "\n")
+            out("\n  " + dim(footer) + "\n")
+        key = read_key(0.5 if dynamic else None)
+        if key is None:
+            continue
         notice = ""
         if isinstance(key, tuple):
             notice = on_paste(key[1]) if on_paste else ""
@@ -307,6 +316,68 @@ def save_config(cfg):
 
 def out_dir(cfg):
     return os.path.abspath(os.path.expanduser(cfg["out_dir"] or os.getcwd()))
+
+
+# ─── обновления ──────────────────────────────────────────────────────────────
+
+UPDATE_URL = os.environ.get("GETIP_UPDATE_URL",
+                            "https://raw.githubusercontent.com/MoteoDimassi/getip/main/getip.py")
+INSTALL_CMD = "curl -fsSL https://raw.githubusercontent.com/MoteoDimassi/getip/main/install.sh | sh"
+VERSION_RE = re.compile(r'^VERSION = "([\d.]+)"', re.M)
+
+
+def parse_version(v):
+    return tuple(int(x) for x in v.split(".") if x.isdigit())
+
+
+class UpdateCheck:
+    """Один раз за запуск, в фоне, узнаёт, есть ли на GitHub версия новее.
+    Ошибки сети молча игнорируются — без интернета getip работает как обычно."""
+
+    def __init__(self):
+        self.latest = None
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        try:
+            req = urllib.request.Request(UPDATE_URL, headers={"User-Agent": "getip",
+                                                              "Range": "bytes=0-8191"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                head = r.read(8192).decode("utf-8", "ignore")
+            m = VERSION_RE.search(head)
+            if m and parse_version(m.group(1)) > parse_version(VERSION):
+                self.latest = m.group(1)
+        except Exception:
+            pass
+
+
+def self_update(version):
+    """Скачивает новую версию поверх текущего файла и перезапускает getip."""
+    header(f"Обновление до {version}")
+    path = os.path.realpath(sys.argv[0])
+    out(f"  {dim('Скачиваю новую версию…')}\n")
+    try:
+        req = urllib.request.Request(UPDATE_URL, headers={"User-Agent": "getip"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            code = r.read()
+        text = code.decode("utf-8")
+        ast.parse(text)
+        if not VERSION_RE.search(text):
+            raise ValueError("скачанный файл не похож на getip")
+        tmp = path + ".new"
+        with open(tmp, "wb") as f:
+            f.write(code)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, path)  # замена целиком: файл никогда не бывает «наполовину обновлён»
+    except Exception as e:
+        out(f"\n  {red('✖')} Не получилось обновиться: {e}\n")
+        out(f"  {dim('Обновите вручную командой:')}\n  {cyan(INSTALL_CMD)}\n")
+        pause()
+        return
+    out(f"  {green('✔')} Обновлено до версии {bold(version)}. Перезапускаю…\n")
+    time.sleep(1)
+    cursor(True)
+    os.execv(sys.executable, [sys.executable, path])
 
 
 # ─── сеть ────────────────────────────────────────────────────────────────────
@@ -956,21 +1027,44 @@ def confirm_exit():
 
 def interactive(cfg):
     keys = list(MODES)
-    items = [MODES[k] for k in keys] + [("Настройки", ""), ("Открыть папку с файлами", ""), ("Выход", "")]
+    update = UpdateCheck()  # проверка в фоне; пункт «Обновить» появится, когда придёт ответ
+    update_label = lambda: f"⬆ Обновить до {update.latest}"
+
+    def items():
+        rows = [MODES[k] for k in keys] + [("Настройки", ""), ("Открыть папку с файлами", "")]
+        if update.latest:
+            rows.append((update_label(), f"сейчас у вас {VERSION}"))
+        return rows + [("Выход", "")]
+
+    def body():
+        text = ("  " + dim("Файлы сохраняются в: ") + pretty(out_dir(cfg)) + "\n"
+                "  " + dim("Перетащите папку в это окно, чтобы сохранять файлы туда."))
+        if update.latest:
+            text += f"\n\n  {green('⬆')} Вышла новая версия {bold(update.latest)} — выберите «Обновить» в меню."
+        return text
+
+    def details(n):
+        if n < len(keys):
+            return render_tips(keys[n])
+        if items()[n][0] == update_label():
+            return (f"  {bold(cyan('Что делает'))}\n    Скачает getip {update.latest} с GitHub и перезапустит"
+                    f" программу.\n    Настройки и сохранённые файлы останутся на месте.\n")
+        return ""
+
     index = 0
     while True:
-        body = lambda: ("  " + dim("Файлы сохраняются в: ") + pretty(out_dir(cfg)) + "\n"
-                        "  " + dim("Перетащите папку в это окно, чтобы сохранять файлы туда."))
         i = menu("Главное меню", items, body=body, index=index, on_paste=lambda t: drop_folder(cfg, t),
-                 details=lambda n: render_tips(keys[n]) if n < len(keys) else "",
-                 footer="↑↓ выбор · → или Enter — открыть · ← — выход")
-        if i is None or i == len(items) - 1:
+                 details=details, footer="↑↓ выбор · → или Enter — открыть · ← — выход")
+        rows = items()
+        if i is None or i == len(rows) - 1:
             index = i if i is not None else index
             if confirm_exit():
                 break
             continue
         index = i
-        if i < len(keys):
+        if rows[i][0] == update_label():
+            self_update(update.latest)
+        elif i < len(keys):
             mode = keys[i]
             if mode == "app":
                 target = pick_app()
