@@ -2,12 +2,16 @@
 # Установщик getip.
 #   Установить или обновить:  curl -fsSL https://raw.githubusercontent.com/MoteoDimassi/getip/main/install.sh | sh
 #   Удалить:                  curl -fsSL https://raw.githubusercontent.com/MoteoDimassi/getip/main/install.sh | sh -s -- --uninstall
+#
+# Ставит две вещи: пакет с кодом в ~/.local/share/getip/getip и запускалку ~/.local/bin/getip.
+# Этим же скриптом getip обновляет сам себя.
 set -e
 
 REPO="${GETIP_REPO:-MoteoDimassi/getip}"
 BRANCH="${GETIP_BRANCH:-main}"
-URL="https://raw.githubusercontent.com/$REPO/$BRANCH/getip.py"
+ARCHIVE="${GETIP_ARCHIVE:-https://codeload.github.com/$REPO/tar.gz/refs/heads/$BRANCH}"
 BIN="${GETIP_BIN:-$HOME/.local/bin}"
+DATA="$(dirname "$BIN")/share/getip"   # запускалка ищет пакет именно здесь: <bin>/../share/getip
 PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
 
 if [ -t 1 ]; then C='\033[36m'; G='\033[32m'; R='\033[31m'; D='\033[2m'; N='\033[0m'; else C=; G=; R=; D=; N=; fi
@@ -16,6 +20,7 @@ fail() { say "${R}✖${N} $*"; exit 1; }
 
 if [ "$1" = "--uninstall" ]; then
     rm -f "$BIN/getip"
+    rm -rf "$DATA"
     rm -rf "$HOME/.config/getip"
     say "${G}✔${N} getip удалён"
     exit 0
@@ -41,27 +46,44 @@ fi
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' \
     || fail "Нужен Python 3.9 или новее, у вас $(python3 -V 2>&1)"
 
-# Скачиваем во временный файл и ставим, только если загрузка прошла целиком
-tmp="$(mktemp)"
-trap 'rm -f "$tmp"' EXIT
+# Код берём из склонированного репозитория (запуск ./install.sh) или архивом с GitHub
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
 script_dir=""
 # при `curl … | sh` $0 — это «sh», а не файл; локальную копию берём только при запуске ./install.sh
 if [ -f "$0" ] && [ "${0##*/}" = "install.sh" ]; then script_dir="$(cd "$(dirname "$0")" && pwd)"; fi
-if [ -n "$script_dir" ] && [ -f "$script_dir/getip.py" ] && [ -z "$GETIP_FORCE_DOWNLOAD" ]; then
-    cp "$script_dir/getip.py" "$tmp"          # запуск из склонированного репозитория
-elif command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$URL" -o "$tmp" || fail "Не удалось скачать $URL"
-elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$tmp" "$URL" || fail "Не удалось скачать $URL"
+if [ -n "$script_dir" ] && [ -f "$script_dir/src/getip/__init__.py" ] && [ -z "$GETIP_FORCE_DOWNLOAD" ]; then
+    src="$script_dir"
 else
-    fail "Нужен curl или wget"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$ARCHIVE" -o "$tmp/getip.tar.gz" || fail "Не удалось скачать $ARCHIVE"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$tmp/getip.tar.gz" "$ARCHIVE" || fail "Не удалось скачать $ARCHIVE"
+    else
+        fail "Нужен curl или wget"
+    fi
+    tar -xzf "$tmp/getip.tar.gz" -C "$tmp" || fail "Скачанный архив повреждён, попробуйте ещё раз"
+    src="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
 fi
-grep -q "getip" "$tmp" && python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$tmp" \
-    || fail "Скачанный файл повреждён, попробуйте ещё раз"
+[ -f "$src/getip.py" ] && [ -f "$src/src/getip/__init__.py" ] \
+    && python3 -c "import ast, pathlib, sys
+files = [pathlib.Path(sys.argv[1])] + sorted(pathlib.Path(sys.argv[2]).rglob('*.py'))
+for f in files: ast.parse(f.read_text(encoding='utf-8'))" "$src/getip.py" "$src/src/getip" \
+    || fail "Скачанные файлы повреждены, попробуйте ещё раз"
 
-mkdir -p "$BIN"
-mv "$tmp" "$BIN/getip"
-chmod 755 "$BIN/getip"
+# Пакет собираем рядом и подменяем переименованием, чтобы старый и новый код не смешались
+mkdir -p "$BIN" "$(dirname "$DATA")"
+rm -rf "$DATA.new" "$DATA.old"
+mkdir -p "$DATA.new"
+cp -R "$src/src/getip" "$DATA.new/getip"
+find "$DATA.new" -name __pycache__ -type d -prune -exec rm -rf {} +
+if [ -d "$DATA" ]; then mv "$DATA" "$DATA.old"; fi
+mv "$DATA.new" "$DATA"
+rm -rf "$DATA.old"
+
+cp "$src/getip.py" "$BIN/getip.new"
+chmod 755 "$BIN/getip.new"
+mv -f "$BIN/getip.new" "$BIN/getip"
 say "${G}✔${N} getip $("$BIN/getip" --version | cut -d' ' -f2) установлен в ${D}$BIN/getip${N}"
 
 # Добавляем ~/.local/bin в PATH, если его там нет
