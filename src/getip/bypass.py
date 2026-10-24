@@ -3,7 +3,7 @@
 VPN на компьютере забирает себе маршрут по умолчанию, но более точный маршрут главнее:
 подсеть, направленная через шлюз роутера (192.168.1.1 на en0), идёт мимо VPN. Список таких
 подсетей getip хранит сам — системные маршруты пропадают после перезагрузки и смены сети,
-а по списку их можно включить заново.
+а по списку их можно включить заново. Запись можно и выключить, не убирая из списка.
 
 Модуль ничего не печатает, а команды выполняет переданная функция run, поэтому всё,
 кроме самого запуска команд, проверяют тесты."""
@@ -21,8 +21,14 @@ from .tunnel import is_ip
 BYPASS_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "bypass.json")
 KINDS = {"site": "сайт", "app": "программа"}
 
-# net — подсеть (ip_network), source — сайт или программа, ради которых её добавили, kind — site / app
-Route = namedtuple("Route", "net source kind")
+# net — подсеть (ip_network), source — сайт или программа, ради которых её добавили, kind — site / app,
+# off — запись выключена: остаётся в списке, но её маршрута в системе нет
+Route = namedtuple("Route", "net source kind off", defaults=(False,))
+
+
+def route_key(r):
+    """Запись без признака «выключена» — по нему записи не различаем."""
+    return r.net, r.source, r.kind
 
 
 def load_routes(path=BYPASS_PATH):
@@ -35,17 +41,24 @@ def load_routes(path=BYPASS_PATH):
     routes = []
     for row in rows if isinstance(rows, list) else []:
         try:
-            routes.append(Route(ipaddress.ip_network(row["net"]), row["source"], row["kind"]))
-        except (KeyError, TypeError, ValueError):
+            routes.append(Route(ipaddress.ip_network(row["net"]), row["source"], row["kind"],
+                                bool(row.get("off"))))
+        except (AttributeError, KeyError, TypeError, ValueError):
             pass
     return routes
 
 
 def save_routes(routes, path=BYPASS_PATH):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    rows = [{"net": str(r.net), "source": r.source, "kind": r.kind} for r in routes]
+    rows = [{"net": str(r.net), "source": r.source, "kind": r.kind, **({"off": True} if r.off else {})}
+            for r in routes]
     with open(path, "w", encoding="utf-8") as f:
         json.dump(rows, f, ensure_ascii=False, indent=2)
+
+
+def wanted(routes):
+    """Подсети, маршруты которых должны быть в системе, — те, что нужны хоть одной включённой записи."""
+    return {r.net for r in routes if not r.off}
 
 
 def add_routes(routes, source, kind, nets):
@@ -59,10 +72,29 @@ def add_routes(routes, source, kind, nets):
 
 def remove_routes(routes, chosen):
     """Убирает выбранные записи. Возвращает (оставшиеся, подсети, которые больше никому не нужны) —
-    маршрут подсети, которая нужна ещё и другому сайту или программе, остаётся в системе."""
-    chosen = set(chosen)
-    left = [r for r in routes if r not in chosen]
-    return left, sorted({r.net for r in chosen} - {r.net for r in left})
+    маршрут подсети, которая нужна ещё и другому включённому сайту или программе, остаётся в системе."""
+    keys = {route_key(r) for r in chosen}
+    left = [r for r in routes if route_key(r) not in keys]
+    return left, sorted({r.net for r in chosen} - wanted(left))
+
+
+def switch(routes, chosen, off):
+    """Выключает (off=True) или включает выбранные записи, не убирая их из списка. Возвращает
+    (новый список, подсети, маршруты которых пора убрать из системы или добавить в неё)."""
+    keys = {route_key(r) for r in chosen}
+    new = [r._replace(off=off) if route_key(r) in keys else r for r in routes]
+    nets = {r.net for r in chosen}
+    return new, sorted(nets - wanted(new) if off else nets)
+
+
+def toggle_plan(chosen, table, gw):
+    """Что сделать с записями по клавише r. restore — вернуть в систему включённые записи, маршруты
+    которых пропали (после перезагрузки или смены сети), выключенные не трогая; off — всё работает,
+    выключаем; on — включаем все."""
+    enabled = [r for r in chosen if not r.off]
+    if any(route_state(r.net, table, gw) != "on" for r in enabled):
+        return "restore"
+    return "off" if len(enabled) == len(chosen) else "on"
 
 
 def group_routes(routes):

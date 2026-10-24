@@ -2,9 +2,10 @@
 
 Сайт или программу выбирают так же, как для .bat, и адреса собирают те же режимы (scans.py).
 Найденные подсети направляются через шлюз роутера и попадают в список (bypass.py). На экране
-списка маршруты удаляют по одному или все сразу и включают заново после перезагрузки."""
-from .bypass import (KINDS, add_routes, apply, group_routes, load_routes, remove_routes, route_state,
-                     save_routes, system_table, to_add, to_delete, withdraw)
+списка маршруты включают и выключают, удаляют по одному или все сразу."""
+from .bypass import (KINDS, add_routes, apply, group_routes, load_routes, remove_routes, route_key,
+                     route_state, save_routes, switch, system_table, to_add, to_delete, toggle_plan,
+                     withdraw)
 from .scans import ask_site, collect, pick_app
 from .style import bold, cyan, dim, green, red, yellow
 from .term import CLEAR, TTY, cursor, header, header_text, out, read_key, term_size
@@ -16,7 +17,7 @@ SUDO_REASON = "Чтобы менять маршруты, нужен пароль
 SHOW_NETS = 12   # столько подсетей показываем в вопросах, остальные — строкой «… и ещё»
 BIG_PREFIX = 16  # подсеть крупнее /16 уводит мимо VPN и чужие сайты — предупреждаем
 SITE_MODES = ("quick", "deep", "sniff")
-LIST_KEYS = ("↑↓ выбор · Пробел — отметить · a — все/ничего · r — включить заново · ← — назад",
+LIST_KEYS = ("↑↓ выбор · Пробел — отметить · a — все/ничего · r — включить/выключить · ← — назад",
              "⌫ — удалить отмеченные · x — удалить весь список")
 
 
@@ -43,7 +44,7 @@ def chosen_text(chosen):
         if not take:
             break
         lines.append(f"    {bold(source)} {dim(KINDS[kind])}")
-        lines += [f"      {r.net}" for r in take]
+        lines += [f"      {r.net}" + (dim("  выключен") if r.off else "") for r in take]
         shown += len(take)
     if len(chosen) > shown:
         lines.append("    " + dim(f"… и ещё подсетей: {len(chosen) - shown}"))
@@ -62,10 +63,12 @@ def offer(target, kind, nets):
         pause()
         return
     routes, added = add_routes(load_routes(), target, kind, nets)
-    mine = [r.net for r in routes if (r.source, r.kind) == (target, kind)]
+    # сайт добавляют ещё раз — значит, он нужен мимо VPN: выключенные его записи тоже включаем
+    routes, mine = switch(routes, [r for r in routes if (r.source, r.kind) == (target, kind)], False)
     table = system_table()
     need = to_add(mine, table, gw[0])
     if not need:
+        save_routes(routes)
         out(f"\n  {green('✔')} {bold(target)} уже идёт мимо VPN: все найденные подсети в списке и действуют.\n")
         pause()
         return
@@ -94,7 +97,7 @@ def offer(target, kind, nets):
     for net, err in failed.items():
         out(f"  {red('✖')} {net}  {dim(err)}\n")
     if failed:
-        out("    " + dim("Эти подсети остались в списке — включите их заново в «Маршруты мимо VPN».") + "\n")
+        out("    " + dim("Эти подсети остались в списке — включите их клавишей r в «Маршруты мимо VPN».") + "\n")
     pause()
 
 
@@ -130,13 +133,24 @@ def list_rows(routes):
     return rows
 
 
-def state_text(net, table, gw):
-    state = route_state(net, table, gw[0] if gw else None)
+def row_keys(row):
+    """Записи, к которым относится строка: у заголовка — вся группа."""
+    kind, data = row
+    return {route_key(r) for r in data[2]} if kind == "group" else {route_key(data)}
+
+
+def state_text(r, table, gw, others):
+    """Состояние записи. others — другие включённые сайты и программы с той же подсетью."""
+    if r.off:
+        return dim("○ выключен") + (dim("  · подсеть всё равно мимо VPN: нужна для " + ", ".join(others))
+                                    if others else "")
+    state = route_state(r.net, table, gw[0] if gw else None)
+    also = dim("  · нужна и для " + ", ".join(others)) if others else ""
     if state == "on":
-        return green("✔ мимо VPN")
+        return green("✔ мимо VPN") + also
     if state == "stale":
-        return yellow(f"↻ через шлюз прежней сети {table[net]}") + dim(" — r, чтобы включить заново")
-    return yellow("○ не действует") + dim(" — r, чтобы включить")
+        return yellow(f"! через шлюз прежней сети {table[r.net]}") + dim(" — r, чтобы включить") + also
+    return yellow("! не действует") + dim(" — r, чтобы включить") + also
 
 
 def row_text(row, current, marked, table, gw, sources):
@@ -144,22 +158,31 @@ def row_text(row, current, marked, table, gw, sources):
     kind, data = row
     if kind == "group":
         source, what, items = data
-        n = sum(r in marked for r in items)
+        n = sum(route_key(r) in marked for r in items)
         box = green("◉") if n == len(items) else yellow("◐") if n else dim("○")
         name = bold(cyan(source)) if current else bold(source)
-        return f"  {pointer} {box} {name}   {dim(KINDS[what] + ' · подсетей: ' + str(len(items)))}"
-    box = green("◉") if data in marked else dim("○")
+        off = sum(r.off for r in items)
+        return (f"  {pointer} {box} {name}   {dim(KINDS[what] + ' · подсетей: ' + str(len(items)))}"
+                + (dim(f" · выключено: {off}") if off else ""))
+    box = green("◉") if route_key(data) in marked else dim("○")
     net = str(data.net).ljust(18)
     others = [s for s in sources[data.net] if s != data.source]
-    also = dim("  · нужна и для " + ", ".join(others)) if others else ""
-    return f"  {pointer}   {box} {bold(cyan(net)) if current else net} {state_text(data.net, table, gw)}{also}"
+    label = bold(cyan(net)) if current else dim(net) if data.off else net
+    return f"  {pointer}   {box} {label} {state_text(data, table, gw, others)}"
 
 
 def draw_list(routes, rows, marked, index, notice, gw, table):
-    nets = {r.net for r in routes}
-    on = sum(route_state(n, table, gw[0] if gw else None) == "on" for n in nets)
-    top = header_text(BYPASS["list"][0]) + gateway_line(gw)
-    top += (dim(f" · подсетей: {len(nets)} · действуют: {on}") if routes else "") + "\n\n"
+    # считаем записи — те же строки, что на экране
+    enabled = [r for r in routes if not r.off]
+    on = sum(route_state(r.net, table, gw[0] if gw else None) == "on" for r in enabled)
+    top = header_text(BYPASS["list"][0]) + gateway_line(gw) + "\n"
+    if routes:
+        off = len(routes) - len(enabled)
+        top += "  " + dim(f"Подсетей: {len(routes)} · действуют: {on}" + (f" · выключено: {off}" if off else "")) + "\n"
+        if len(enabled) > on and gw:
+            top += (f"  {yellow('!')} Не действуют после перезагрузки или смены сети: {len(enabled) - on}"
+                    f" {dim('— a, затем r, чтобы вернуть')}\n")
+    top += "\n"
     keys = LIST_KEYS if routes else ("← — назад",)
     bottom = "\n" + (f"  {notice}\n" if notice else "") + "\n".join("  " + dim(k) for k in keys)
     if not routes:
@@ -168,9 +191,11 @@ def draw_list(routes, rows, marked, index, notice, gw, table):
         # строки «↑ ещё» и «↓ ещё» тоже занимают место
         height = max(3, term_size().lines - top.count("\n") - bottom.count("\n") - 3) if TTY else len(rows)
         start = min(max(0, index - height // 2), max(0, len(rows) - height))
-        sources = {}
+        sources = {}  # подсеть -> включённые сайты и программы, которым она нужна
         for r in routes:
-            sources.setdefault(r.net, []).append(r.source)
+            sources.setdefault(r.net, [])
+            if not r.off:
+                sources[r.net].append(r.source)
         lines = ["  " + dim(f"  ↑ ещё {start}")] if start else []
         lines += [row_text(rows[i], i == index, marked, table, gw, sources)
                   for i in range(start, min(len(rows), start + height))]
@@ -183,7 +208,6 @@ def draw_list(routes, rows, marked, index, notice, gw, table):
 
 def delete(routes, chosen, title, text):
     """Удаляет выбранные записи, если пользователь подтвердит. Возвращает строку-уведомление."""
-    chosen = [r for r in routes if r in set(chosen)]
     if not confirm(title, "Да, удалить", "Нет, оставить", body=f"  {dim(text)}\n{chosen_text(chosen)}"):
         return dim("Ничего не удалено")
     _, gone = remove_routes(routes, chosen)
@@ -192,38 +216,49 @@ def delete(routes, chosen, title, text):
         return f"{red('✖')} Пароль не введён — ничего не удалено"
     failed = withdraw(gone, table)
     # маршрут, который не удалось убрать из системы, оставляем и в списке — иначе его не найти
-    removed = {r for r in chosen if r.net not in failed}
-    save_routes([r for r in routes if r not in removed])
+    removed = [r for r in chosen if r.net not in failed]
+    save_routes(remove_routes(routes, removed)[0])
     note = f"{green('✔')} Удалено из списка: {len(removed)}"
     if failed:
         note += f"   {red('✖')} не удалось убрать из системы: {len(failed)} — {next(iter(failed.values()))}"
     return note
 
 
-def reapply(routes, gw, table):
-    """Включает заново маршруты, которых нет в системе (после перезагрузки или смены сети)."""
-    if not gw:
+def toggle(routes, chosen, gw, table):
+    """Клавиша r: выключает работающие записи или включает остальные (см. toggle_plan).
+    Возвращает строку-уведомление."""
+    plan = toggle_plan(chosen, table, gw[0] if gw else None)
+    if plan == "restore":
+        chosen = [r for r in chosen if not r.off]
+    off = plan == "off"
+    if not off and not gw:
         return f"{red('✖')} Нет подключения к роутеру — включать не через что"
-    need = to_add(sorted({r.net for r in routes}), table, gw[0])
-    if not need:
-        return f"{green('✔')} Все маршруты и так действуют"
-    out("\n")
-    if not get_sudo(SUDO_REASON):
-        return f"{red('✖')} Пароль не введён — ничего не включено"
-    failed = apply(need, gw[0], table)
-    note = f"{green('✔')} Включено заново: {len(need) - len(failed)}"
+    new, nets = switch(routes, chosen, off)
+    need = to_delete(nets, table) if off else to_add(nets, table, gw[0])
+    if need:
+        out("\n")
+        if not get_sudo(SUDO_REASON):
+            return f"{red('✖')} Пароль не введён — ничего не изменилось"
+    failed = withdraw(nets, table) if off else apply(nets, gw[0], table)
+    if off and failed:  # маршрут остался в системе — пусть и запись остаётся включённой
+        new, _ = switch(new, [r for r in chosen if r.net in failed], False)
+    save_routes(new)
+    done = len(need) - len(failed) if plan == "restore" else sum(r.net not in failed for r in chosen)
+    note = {"off": f"{green('✔')} Выключено: {done} {dim('— снова через VPN, в списке остались')}",
+            "on": f"{green('✔')} Включено: {done} {dim('— мимо VPN')}",
+            "restore": f"{green('✔')} Возвращено в систему: {done}"}[plan]
     if failed:
         note += f"   {red('✖')} не вышло: {len(failed)} — {next(iter(failed.values()))}"
     return note
 
 
 def routes_screen():
-    """Все маршруты мимо VPN: пробел отмечает, ⌫ удаляет отмеченные, x — весь список, r — включает заново."""
-    marked, index, notice = set(), 0, ""
+    """Все маршруты мимо VPN: пробел отмечает, r включает и выключает, ⌫ удаляет отмеченные, x — весь список."""
+    marked, index, notice = set(), 0, ""  # marked — ключи записей (route_key)
     while True:
         routes, gw, table = load_routes(), physical_route(), system_table()
         rows = list_rows(routes)
-        marked &= set(routes)
+        marked &= {route_key(r) for r in routes}
         index = min(index, max(0, len(rows) - 1))
         cursor(False)
         draw_list(routes, rows, marked, index, notice, gw, table)
@@ -236,28 +271,31 @@ def routes_screen():
             return
         if not rows:
             continue
+        chosen = [r for r in routes if route_key(r) in marked]
         if key in ("up", "k"):
             index = (index - 1) % len(rows)
         elif key in ("down", "j"):
             index = (index + 1) % len(rows)
         elif key == " ":
-            kind, data = rows[index]
-            items = set(data[2]) if kind == "group" else {data}
+            items = row_keys(rows[index])
             marked = marked - items if items <= marked else marked | items
         elif key in ("a", "ф"):
-            marked = set() if marked == set(routes) else set(routes)
+            every = {route_key(r) for r in routes}
+            marked = set() if marked == every else every
+        elif key in ("r", "к"):
+            # отмеченные, а если ничего не отмечено — строка под курсором
+            current = row_keys(rows[index])
+            notice = toggle(routes, chosen or [r for r in routes if route_key(r) in current], gw, table)
         elif key in ("backspace", "delete", "d", "в"):
-            if marked:
-                notice = delete(routes, marked, "Удалить отмеченные маршруты?",
-                                f"Отмечено: {len(marked)}. Эти подсети снова пойдут через VPN:")
+            if chosen:
+                notice = delete(routes, chosen, "Удалить отмеченные маршруты?",
+                                f"Отмечено: {len(chosen)}. Эти подсети снова пойдут через VPN:")
             else:
                 notice = f"{yellow('!')} Сначала отметьте маршруты пробелом"
         elif key in ("x", "ч"):
             notice = delete(routes, routes, "Удалить все маршруты мимо VPN?",
-                            f"Сайтов и программ: {len(group_routes(routes))}, подсетей: {len({r.net for r in routes})}."
+                            f"Сайтов и программ: {len(group_routes(routes))}, подсетей: {len(routes)}."
                             f" Все они снова пойдут через VPN:")
-        elif key in ("r", "к"):
-            notice = reapply(routes, gw, table)
 
 
 def bypass_menu(cfg):
@@ -266,7 +304,7 @@ def bypass_menu(cfg):
     tips = ("bypass_site", "bypass_app", "bypass_list")
     index = 0
     while True:
-        count = len({r.net for r in load_routes()})
+        count = len(load_routes())
         rows = [BYPASS["site"], BYPASS["app"],
                 (BYPASS["list"][0], f"подсетей: {count} · {BYPASS['list'][1]}"), ("Назад", "")]
         i = menu(BYPASS_ENTRY[0], rows, body=gateway_line(physical_route()), index=index,

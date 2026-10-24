@@ -6,7 +6,7 @@
   getip claude.ai -s     слушать DNS-трафик, пока вы пользуетесь сайтом (нужен sudo)
   getip -A Claude        отслеживать соединения программы (без DNS и без sudo)
   getip -C Claude        проверить, идёт ли трафик программы через туннель роутера
-  getip -b               маршруты мимо VPN: посмотреть, удалить, включить заново
+  getip -b               маршруты мимо VPN: включить, выключить, удалить
 """
 import argparse
 
@@ -35,7 +35,7 @@ def main():
     g.add_argument("-C", "--check", metavar="ПРИЛОЖЕНИЕ",
                    help="проверить, идёт ли трафик программы через туннель роутера, напр. -C Claude")
     g.add_argument("-b", "--bypass", action="store_true",
-                   help="маршруты мимо VPN: посмотреть, удалить, включить заново")
+                   help="маршруты мимо VPN: включить, выключить, удалить")
     p.add_argument("-t", "--time", type=int, help="длительность глубокого сканирования, сек")
     p.add_argument("-a", "--append", action="store_true", help="дополнить существующий .bat")
     p.add_argument("-o", "--out", help="папка для .bat (по умолчанию — текущая)")

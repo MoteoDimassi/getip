@@ -6,7 +6,8 @@ from unittest import mock
 
 from getip import bypass
 from getip.bypass import (Route, add_routes, apply, group_routes, load_routes, parse_ip_route,
-                          parse_netstat, remove_routes, route_state, save_routes, to_delete, withdraw)
+                          parse_netstat, remove_routes, route_state, save_routes, switch, to_delete,
+                          toggle_plan, withdraw)
 from getip.tunnel import parse_default_route
 
 net = ipaddress.ip_network
@@ -122,6 +123,40 @@ class ListTest(unittest.TestCase):
         self.assertEqual([(s, k, len(items)) for s, k, items in groups],
                          [("claude.ai", "site", 2), ("Telegram", "app", 1)])
 
+    def test_switch_off_keeps_route_needed_by_other(self):
+        routes, nets = switch(self.routes, self.routes[:2], True)
+        self.assertTrue(routes[0].off and routes[1].off and not routes[2].off)
+        self.assertEqual(nets, [net("160.79.104.0/23")])  # 104.16/13 ещё нужна Telegram
+        routes, nets = switch(routes, routes[2:], True)
+        self.assertEqual(nets, [net("104.16.0.0/13")])    # теперь не нужна никому
+
+    def test_switch_on_matches_by_key(self):
+        routes, _ = switch(self.routes, self.routes[:1], True)
+        # записи из старого списка (ещё без признака «выключена») находят свою пару
+        routes, nets = switch(routes, self.routes[:1], False)
+        self.assertEqual(routes, self.routes)
+        self.assertEqual(nets, [net("160.79.104.0/23")])
+
+    def test_remove_ignores_disabled_neighbours(self):
+        routes, _ = switch(self.routes, self.routes[2:], True)  # Telegram выключен
+        _, gone = remove_routes(routes, routes[1:2])
+        self.assertEqual(gone, [net("104.16.0.0/13")])  # выключенной записи маршрут не нужен
+
+
+class TogglePlanTest(unittest.TestCase):
+    def test_plan(self):
+        table = {net("104.16.0.0/13"): GW}
+        on = Route(net("104.16.0.0/13"), "claude.ai", "site")
+        lost = Route(net("34.36.0.0/16"), "claude.ai", "site")
+        off = Route(net("160.79.104.0/23"), "claude.ai", "site", True)
+        self.assertEqual(toggle_plan([on], table, GW), "off")
+        self.assertEqual(toggle_plan([off], table, GW), "on")
+        self.assertEqual(toggle_plan([lost], table, GW), "restore")
+        self.assertEqual(toggle_plan([on, off], table, GW), "on")
+        # после перезагрузки сначала возвращаем включённые, выключенные не трогаем
+        self.assertEqual(toggle_plan([on, lost, off], table, GW), "restore")
+        self.assertEqual(toggle_plan([on], table, None), "restore")  # нет подключения к роутеру
+
 
 class StoreTest(unittest.TestCase):
     def setUp(self):
@@ -132,9 +167,12 @@ class StoreTest(unittest.TestCase):
         self.dir.cleanup()
 
     def test_round_trip(self):
-        routes = [Route(net("104.16.0.0/13"), "Telegram", "app")]
+        routes = [Route(net("104.16.0.0/13"), "Telegram", "app"),
+                  Route(net("1.2.3.0/24"), "a.ru", "site", True)]
         save_routes(routes, self.path)
         self.assertEqual(load_routes(self.path), routes)
+        with open(self.path) as f:
+            self.assertEqual(f.read().count('"off"'), 1)  # у включённых записей признака нет
 
     def test_missing_and_broken(self):
         self.assertEqual(load_routes(self.path), [])
