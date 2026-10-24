@@ -1,10 +1,11 @@
-"""Экранные элементы: меню, список с галочками, вопрос, пауза, строка-спиннер."""
+"""Экранные элементы: меню, список с галочками, вопрос, пароль sudo, пауза, строка-спиннер."""
 import os
 import re
+import subprocess
 import threading
 import time
 
-from .style import bold, cyan, dim, green, visible
+from .style import bold, cyan, dim, green, visible, yellow
 from .term import CLEAR, TTY, cursor, header, header_text, out, read_key, term_size, window
 
 MIN_DETAILS = 6  # если под подсказку остаётся меньше строк, шапку меню сворачиваем в одну строку
@@ -151,6 +152,27 @@ def checklist(title, rows, checked, body=""):
             checked = set() if len(checked) == len(rows) else {k for k, _ in rows}
         elif key in ("enter", "q", "esc"):
             return checked
+
+
+def confirm(title, yes, no, body="", default_yes=False):
+    """Вопрос «да или нет» в виде меню. По умолчанию курсор стоит на «нет». True — выбрали «да»."""
+    rows = [(yes, ""), (no, "")] if default_yes else [(no, ""), (yes, "")]
+    i = menu(title, rows, body=body, footer="↑↓ выбор · → или Enter — подтвердить · ← — назад")
+    return i == (0 if default_yes else 1)
+
+
+def get_sudo(reason):
+    """Права администратора для команд `sudo -n`: спрашивает пароль, если его ещё не вводили
+    (sudo помнит его несколько минут). False — пароль не ввели."""
+    if os.geteuid() == 0 or subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0:
+        return True
+    out(f"  {yellow('🔒')} {reason}\n")
+    cursor(True)
+    try:
+        return subprocess.run(["sudo", "-v"]).returncode == 0
+    except KeyboardInterrupt:
+        out("\n")
+        return False
 
 
 def ask(prompt, default=""):

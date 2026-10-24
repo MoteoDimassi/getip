@@ -1,7 +1,8 @@
 """Режимы сбора адресов в <имя>.bat: быстрый, глубокий, прослушивание DNS и слежка за программой.
 
 Каждый режим — функция (collector, live): складывает найденные IP в collector,
-а ход работы пишет в live. run_scan запускает режим и сохраняет результат."""
+а ход работы пишет в live. collect запускает режим, run_scan — ещё и сохраняет результат.
+ask_site и pick_app — экраны выбора сайта и программы для режимов."""
 import os
 import re
 import subprocess
@@ -13,13 +14,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from .collector import Collector
 from .config import load_config, save_config
 from .connections import connections_of, lsof_connections
-from .domains import is_noise
+from .domains import is_noise, normalize_domain
 from .lookup import crtsh_names, resolve_everywhere
 from .routes import bat_path, write_bat
 from .style import bold, cyan, dim, green, pretty, red, yellow
-from .term import TTY, cursor, header, out
-from .texts import MODES, print_tips
-from .widgets import Live, checklist, wait_for_stop
+from .term import TTY, header, out
+from .texts import MODES, TIPS_COLUMNS, print_tips, render_tips
+from .widgets import Live, ask, checklist, get_sudo, menu, pause, wait_for_stop
 
 SUBDOMAINS = ["", "www.", "api.", "app.", "cdn.", "static.", "assets.", "media.", "img.",
               "images.", "auth.", "login.", "accounts.", "ws.", "m.", "mobile.", "mail.",
@@ -67,11 +68,8 @@ def deep_scan(col, live):
 
 def sniff(col, live):
     sudo = [] if os.geteuid() == 0 else ["sudo", "-n"]
-    if sudo:
-        out(f"  {yellow('🔒')} Для прослушивания трафика нужен пароль администратора.\n")
-        cursor(True)
-        if subprocess.run(["sudo", "-v"]).returncode != 0:
-            raise RuntimeError("sudo не получен")
+    if sudo and not get_sudo("Для прослушивания трафика нужен пароль администратора."):
+        raise RuntimeError("sudo не получен")
     if sys.platform == "darwin":
         # сбрасываем системный DNS-кэш, чтобы приложения заново спросили адреса
         subprocess.run(sudo + ["dscacheutil", "-flushcache"], capture_output=True)
@@ -158,6 +156,39 @@ def app_scan(col, live):
 SCANNERS = {"quick": quick_scan, "deep": deep_scan, "sniff": sniff, "app": app_scan}
 
 
+def ask_site(cfg, title, tips):
+    """Экран ввода адреса сайта; возвращает домен или None."""
+    header(title)
+    print_tips(tips)
+    out("\n  " + dim("Введите адрес и нажмите Enter · Ctrl+C — назад в меню") + "\n\n")
+    raw = ask("Адрес сайта", cfg["last_domain"])
+    if raw is None:
+        return None
+    target = normalize_domain(raw)
+    if not target:
+        out(f"  {red('✖')} Не похоже на адрес сайта. Пример: claude.ai\n")
+        pause()
+        return None
+    cfg["last_domain"] = target
+    save_config(cfg)
+    return target
+
+
+def pick_app(title, tips):
+    """Список программ с открытыми соединениями; возвращает имя выбранной или None."""
+    body = lambda: render_tips(tips)  # функция: если окно вырастет, текст перенесётся по новой ширине
+    while True:
+        apps = lsof_connections()
+        rows = [("↻ Обновить список", "")] + [
+            (name, f"соединений: {len(conns)}")
+            for name, conns in sorted(apps.items(), key=lambda kv: (-len(kv[1]), kv[0].lower()))]
+        i = menu(title, rows, body=body, columns=TIPS_COLUMNS)
+        if i is None:
+            return None
+        if i > 0:
+            return rows[i][0]
+
+
 def choose_extras(col, remembered):
     groups = col.third_party()
     rows = [(d, f"имён: {len(n)} — " + ", ".join(sorted(n, key=len)[:2]) + ("…" if len(n) > 2 else ""))
@@ -176,13 +207,13 @@ def remember_extras(cfg, target, extras):
     cfg.setdefault("extras", {})[target] = sorted(extras)
 
 
-def run_scan(target, mode, cfg, append=False, tips=False):
-    """Сканирует сайт или приложение и пишет <имя>.bat. Возвращает (путь или None, коллектор)."""
-    path = bat_path(cfg, target)
+def collect(target, mode, cfg, bat=None, tips=False):
+    """Собирает адреса сайта или приложения, ничего не сохраняя. bat — файл, подсети
+    которого дополняем. Возвращает коллектор."""
     live = Live()
     col = Collector(target, cfg, live.log, include_all=(mode == "app"))
-    if append and os.path.exists(path):
-        col.load_bat(path)
+    if bat and os.path.exists(bat):
+        col.load_bat(bat)
     out(f"  {bold(MODES[mode][0])} · {cyan(target)}"
         + (f" {dim('(дополняю ' + str(len(col.file_nets)) + ' подсетей из файла)')}" if col.file_nets else "")
         + "\n\n")
@@ -206,7 +237,13 @@ def run_scan(target, mode, cfg, append=False, tips=False):
         remember_extras(cfg, target, col.extra)
         header()
         out(f"  {bold(MODES[mode][0])} · {cyan(target)}\n")
+    return col
 
+
+def run_scan(target, mode, cfg, append=False, tips=False):
+    """Сканирует сайт или приложение и пишет <имя>.bat. Возвращает (путь или None, коллектор)."""
+    path = bat_path(cfg, target)
+    col = collect(target, mode, cfg, path if append else None, tips)
     if not col.networks():
         out(f"\n  {red('✖')} Не найдено ни одного адреса — проверьте адрес сайта.\n")
         return None, col

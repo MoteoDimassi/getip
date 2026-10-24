@@ -25,7 +25,7 @@ def _run(cmd, timeout=10):
         return ""
 
 
-def _is_ip(text):
+def is_ip(text):
     try:
         ipaddress.ip_address(text)
         return True
@@ -33,14 +33,20 @@ def _is_ip(text):
         return False
 
 
-def parse_default_interface(netstat_text):
-    """Интерфейс маршрута по умолчанию через роутер из `netstat -rn -f inet`; VPN-интерфейсы пропускаем."""
+def parse_default_route(netstat_text):
+    """(шлюз, интерфейс) маршрута по умолчанию через роутер из `netstat -rn -f inet`; VPN-интерфейсы пропускаем."""
     for line in netstat_text.splitlines():
         parts = line.split()
-        if (len(parts) >= 4 and parts[0] == "default" and _is_ip(parts[1])
+        if (len(parts) >= 4 and parts[0] == "default" and is_ip(parts[1])
                 and not parts[3].startswith(VPN_PREFIXES)):
-            return parts[3]
+            return parts[1], parts[3]
     return None
+
+
+def parse_default_interface(netstat_text):
+    """Интерфейс маршрута по умолчанию через роутер; VPN-интерфейсы пропускаем."""
+    route = parse_default_route(netstat_text)
+    return route[1] if route else None
 
 
 def parse_second_hop(traceroute_text):
@@ -56,15 +62,21 @@ def verdict(hop, isp_hops):
     return "direct" if hop in isp_hops else "tunnel"
 
 
+def physical_route():
+    """(шлюз, интерфейс), через которые компьютер подключён к роутеру, — даже когда на нём включён свой VPN."""
+    if sys.platform == "darwin":
+        return parse_default_route(_run(["netstat", "-rn", "-f", "inet"]))
+    for line in _run(["ip", "-4", "route", "show", "default"]).splitlines():
+        m = re.search(r"\bvia (\S+) dev (\S+)", line)
+        if m and not m.group(2).startswith(VPN_PREFIXES):
+            return m.group(1), m.group(2)
+    return None
+
+
 def physical_interface():
     """Интерфейс, которым компьютер подключён к роутеру, — даже когда на нём включён свой VPN."""
-    if sys.platform == "darwin":
-        return parse_default_interface(_run(["netstat", "-rn", "-f", "inet"]))
-    for line in _run(["ip", "-4", "route", "show", "default"]).splitlines():
-        m = re.search(r"\bdev (\S+)", line)
-        if m and " via " in line and not m.group(1).startswith(VPN_PREFIXES):
-            return m.group(1)
-    return None
+    route = physical_route()
+    return route[1] if route else None
 
 
 def system_interface(ip):

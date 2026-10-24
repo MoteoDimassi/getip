@@ -137,7 +137,7 @@ def _drain(fd, wait):
 
 
 def read_key(timeout=None):
-    """Одна клавиша: 'up', 'down', 'enter', 'esc', символ, None по таймауту
+    """Одна клавиша: 'up', 'down', 'enter', 'esc', 'backspace', 'delete', символ, None по таймауту
     или ('paste', текст) — если в окно вставили текст или перетащили папку."""
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
@@ -163,6 +163,8 @@ def read_key(timeout=None):
                 while PASTE_END not in data and select.select([fd], [], [], 1)[0]:
                     data += os.read(fd, 4096)
                 return ("paste", data.split(PASTE_END)[0].decode(errors="ignore"))
+            if seq == b"[3~":
+                return "delete"  # Fn+Delete на Mac
             if seq[:1] in (b"[", b"O"):
                 return {b"A": "up", b"B": "down", b"C": "right", b"D": "left"}.get(seq[-1:], "esc")
             return "esc"
@@ -172,6 +174,8 @@ def read_key(timeout=None):
                 return ("paste", (ch + rest).decode(errors="ignore"))
         if ch in (b"\r", b"\n"):
             return "enter"
+        if ch in (b"\x7f", b"\x08"):
+            return "backspace"  # клавиша Delete (⌫) на Mac
         if ch[0] >= 0xC0:
             ch += os.read(fd, 1 if ch[0] < 0xE0 else 2)
         key = ch.decode(errors="ignore").lower()

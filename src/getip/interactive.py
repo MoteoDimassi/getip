@@ -4,17 +4,16 @@ import os
 import subprocess
 
 from . import VERSION
+from .bypass_menu import bypass_menu
 from .check import run_check
 from .config import out_dir, save_config
-from .connections import lsof_connections
-from .domains import normalize_domain
 from .routes import add_to_bat, bat_path, route_lines
-from .scans import run_scan
+from .scans import ask_site, pick_app, run_scan
 from .style import bold, cyan, dim, green, pretty, red
 from .term import TTY, cursor, header, out, parse_dropped_path, read_key, window
-from .texts import CHECK, MODES, TIPS_COLUMNS, print_tips, render_tips
+from .texts import BYPASS_ENTRY, CHECK, MODES, TIPS_COLUMNS, render_tips
 from .update import UpdateCheck, self_update
-from .widgets import ask, menu, pause
+from .widgets import ask, confirm, menu, pause
 
 
 def show_file(path):
@@ -145,47 +144,18 @@ def settings_menu(cfg):
         save_config(cfg)
 
 
-def pick_app(title, tips):
-    """Список программ с открытыми соединениями; возвращает имя выбранной или None."""
-    body = lambda: render_tips(tips)  # функция: если окно вырастет, текст перенесётся по новой ширине
-    while True:
-        apps = lsof_connections()
-        rows = [("↻ Обновить список", "")] + [
-            (name, f"соединений: {len(conns)}")
-            for name, conns in sorted(apps.items(), key=lambda kv: (-len(kv[1]), kv[0].lower()))]
-        i = menu(title, rows, body=body, columns=TIPS_COLUMNS)
-        if i is None:
-            return None
-        if i > 0:
-            return rows[i][0]
-
-
 def confirm_exit():
-    i = menu("Выйти из getip?", [("Нет, остаться", ""), ("Да, выйти", "")],
-             footer="↑↓ выбор · → или Enter — подтвердить · ← — назад")
-    return i == 1
+    return confirm("Выйти из getip?", "Да, выйти", "Нет, остаться")
 
 
 def scan_flow(cfg, mode):
     """Выбор сайта или программы, сканирование и экран с результатом."""
     if mode == "app":
         target = pick_app(MODES["app"][0], "app")
-        if not target:
-            return
     else:
-        header(MODES[mode][0])
-        print_tips(mode)
-        out("\n  " + dim("Введите адрес и нажмите Enter · Ctrl+C — назад в меню") + "\n\n")
-        raw = ask("Адрес сайта", cfg["last_domain"])
-        if raw is None:
-            return
-        target = normalize_domain(raw)
-        if not target:
-            out(f"  {red('✖')} Не похоже на адрес сайта. Пример: claude.ai\n")
-            pause()
-            return
-        cfg["last_domain"] = target
-        save_config(cfg)
+        target = ask_site(cfg, MODES[mode][0], mode)
+    if not target:
+        return
     append = False
     if os.path.exists(bat_path(cfg, target)):
         choice = menu(f"Файл {os.path.basename(bat_path(cfg, target))} уже существует", [
@@ -219,6 +189,7 @@ def interactive(cfg):
         """Пункты меню: (название, подсказка, действие)."""
         rows = [(label, hint, ("scan", mode)) for mode, (label, hint) in MODES.items()]
         rows += [(*CHECK, ("check", None)),
+                 (*BYPASS_ENTRY, ("bypass", None)),
                  ("Настройки", "", ("settings", None)),
                  ("Открыть папку с файлами", "", ("folder", None))]
         if update.latest:
@@ -236,8 +207,8 @@ def interactive(cfg):
         action, arg = entries()[n][2]
         if action == "scan":
             return render_tips(arg)
-        if action == "check":
-            return render_tips("check")
+        if action in ("check", "bypass"):
+            return render_tips(action)
         if action == "update":
             return (f"  {bold(cyan('Что делает'))}\n    Скачает getip {update.latest} с GitHub и перезапустит"
                     f" программу.\n    Настройки и сохранённые файлы останутся на месте.\n")
@@ -259,6 +230,8 @@ def interactive(cfg):
                 scan_flow(cfg, arg)
             elif action == "check":
                 check_flow(cfg)
+            elif action == "bypass":
+                bypass_menu(cfg)
             elif action == "settings":
                 settings_menu(cfg)
             elif action == "folder":
