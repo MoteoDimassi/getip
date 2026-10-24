@@ -1,13 +1,15 @@
 import ipaddress
 import os
+import socket
 import tempfile
 import unittest
 from unittest import mock
 
 from getip import bypass
-from getip.bypass import (Route, add_routes, apply, group_routes, load_routes, parse_ip_route,
-                          parse_netstat, remove_routes, route_state, save_routes, switch, to_delete,
-                          toggle_plan, withdraw)
+from getip.bypass import (Route, add_routes, apply, covering, group_routes, load_routes, parse_ip_route,
+                          parse_netstat, probe, remove_routes, route_state, save_routes, switch, to_delete,
+                          toggle_plan, vpn_connections, withdraw)
+from getip.connections import Connection
 from getip.tunnel import parse_default_route
 
 net = ipaddress.ip_network
@@ -141,6 +143,31 @@ class ListTest(unittest.TestCase):
         routes, _ = switch(self.routes, self.routes[2:], True)  # Telegram выключен
         _, gone = remove_routes(routes, routes[1:2])
         self.assertEqual(gone, [net("104.16.0.0/13")])  # выключенной записи маршрут не нужен
+
+
+class CheckHelpersTest(unittest.TestCase):
+    def test_covering_prefers_enabled_and_exact(self):
+        routes = [Route(net("104.16.0.0/13"), "a.ru", "site"), Route(net("104.16.1.0/24"), "b.ru", "site", True),
+                  Route(net("104.16.2.0/24"), "c.ru", "site")]
+        self.assertEqual(covering(routes, "104.16.2.5").source, "c.ru")  # точная подсеть важнее крупной
+        self.assertEqual(covering(routes, "104.16.1.5").source, "a.ru")  # включённая важнее выключенной
+        self.assertIsNone(covering(routes, "8.8.8.8"))
+
+    def test_vpn_connections(self):
+        apps = {"Yandex": [Connection("TCP", "10.108.177.221:60775", "172.67.134.103", "443", "ESTABLISHED"),
+                           Connection("TCP", "192.168.1.52:60800", "172.67.134.103", "443", "ESTABLISHED"),
+                           Connection("TCP", "10.108.177.221:60900", "8.8.8.8", "443", "ESTABLISHED")],
+                "Telegram": [Connection("TCP", "[fe80::1]:5000", "2001:db8::1", "443", "ESTABLISHED")]}
+        # через VPN идёт только первое: второе ушло через роутер, третье — не в подсетях мимо VPN
+        self.assertEqual(vpn_connections(apps, [net("172.67.128.0/20")], "192.168.1.52"), {"Yandex": 1})
+
+    def test_probe_local_server(self):
+        with socket.socket() as srv:
+            srv.bind(("127.0.0.1", 0))
+            srv.listen()
+            port = srv.getsockname()[1]
+            self.assertEqual(probe("127.0.0.1", port), (True, "127.0.0.1"))
+        self.assertTrue(probe("127.0.0.1", port)[0])  # порт закрыт, но отказ — тоже ответ
 
 
 class TogglePlanTest(unittest.TestCase):

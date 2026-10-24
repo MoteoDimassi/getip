@@ -2,23 +2,35 @@
 
 Сайт или программу выбирают так же, как для .bat, и адреса собирают те же режимы (scans.py).
 Найденные подсети направляются через шлюз роутера и попадают в список (bypass.py). На экране
-списка маршруты включают и выключают, удаляют по одному или все сразу."""
-from .bypass import (KINDS, add_routes, apply, group_routes, load_routes, remove_routes, route_key,
-                     route_state, save_routes, switch, system_table, to_add, to_delete, toggle_plan,
-                     withdraw)
-from .scans import ask_site, collect, pick_app
+списка маршруты включают и выключают, удаляют по одному или все сразу и проверяют: отвечают ли
+адреса мимо VPN, правда ли уходят через роутер и с каким адресом вас видят сайты."""
+import ipaddress
+import socket
+from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor
+
+from .bypass import (KINDS, add_routes, apply, covering, group_routes, load_routes, probe, remove_routes,
+                     route_key, route_state, router_address, save_routes, switch, system_table, to_add,
+                     to_delete, toggle_plan, vpn_connections, withdraw)
+from .connections import connections_of, lsof_connections
+from .lookup import IP_HOST, geo, public_ip, resolve_system
+from .scans import SUBDOMAINS, ask_site, collect, pick_app
 from .style import bold, cyan, dim, green, red, yellow
 from .term import CLEAR, TTY, cursor, header, header_text, out, read_key, term_size
 from .texts import BYPASS, BYPASS_ENTRY, MODES, TIPS_COLUMNS, render_tips
-from .tunnel import physical_route
-from .widgets import confirm, get_sudo, menu, pause
+from .tunnel import RouterPaths, physical_route
+from .widgets import Live, confirm, get_sudo, menu, pause
 
 SUDO_REASON = "Чтобы менять маршруты, нужен пароль администратора."
 SHOW_NETS = 12   # столько подсетей показываем в вопросах, остальные — строкой «… и ещё»
 BIG_PREFIX = 16  # подсеть крупнее /16 уводит мимо VPN и чужие сайты — предупреждаем
 SITE_MODES = ("quick", "deep", "sniff")
 LIST_KEYS = ("↑↓ выбор · Пробел — отметить · a — все/ничего · r — включить/выключить · ← — назад",
-             "⌫ — удалить отмеченные · x — удалить весь список")
+             "Enter — проверить · ⌫ — удалить отмеченные · x — удалить весь список")
+ROUTER_PATHS = {"direct": "напрямую провайдеру", "tunnel": "в свой туннель", "unknown": "путь не определить"}
+
+# адрес для проверки: label — откуда он (имя сайта или программа и порт), name — имя для проверки HTTPS
+Target = namedtuple("Target", "ip label port name")
 
 
 def gateway_line(gw):
@@ -98,7 +110,8 @@ def offer(target, kind, nets):
         out(f"  {red('✖')} {net}  {dim(err)}\n")
     if failed:
         out("    " + dim("Эти подсети остались в списке — включите их клавишей r в «Маршруты мимо VPN».") + "\n")
-    pause()
+    out("\n")
+    check_flow(target, kind)
 
 
 def choose_method(target):
@@ -224,25 +237,34 @@ def delete(routes, chosen, title, text):
     return note
 
 
+def change(routes, chosen, off, gw, table):
+    """Выключает (off=True) или включает записи вместе с их маршрутами в системе и сохраняет список.
+    Возвращает (подсети, которые меняли в системе, {подсеть: ошибка}) или None, если пароль не ввели."""
+    new, nets = switch(routes, chosen, off)
+    need = to_delete(nets, table) if off else to_add(nets, table, gw[0])
+    if need:
+        out("\n")
+        if not get_sudo(SUDO_REASON):
+            return None
+    failed = withdraw(nets, table) if off else apply(nets, gw[0], table)
+    if off and failed:  # маршрут остался в системе — пусть и запись остаётся включённой
+        new, _ = switch(new, [r for r in chosen if r.net in failed], False)
+    save_routes(new)
+    return need, failed
+
+
 def toggle(routes, chosen, gw, table):
     """Клавиша r: выключает работающие записи или включает остальные (см. toggle_plan).
     Возвращает строку-уведомление."""
     plan = toggle_plan(chosen, table, gw[0] if gw else None)
     if plan == "restore":
         chosen = [r for r in chosen if not r.off]
-    off = plan == "off"
-    if not off and not gw:
+    if plan != "off" and not gw:
         return f"{red('✖')} Нет подключения к роутеру — включать не через что"
-    new, nets = switch(routes, chosen, off)
-    need = to_delete(nets, table) if off else to_add(nets, table, gw[0])
-    if need:
-        out("\n")
-        if not get_sudo(SUDO_REASON):
-            return f"{red('✖')} Пароль не введён — ничего не изменилось"
-    failed = withdraw(nets, table) if off else apply(nets, gw[0], table)
-    if off and failed:  # маршрут остался в системе — пусть и запись остаётся включённой
-        new, _ = switch(new, [r for r in chosen if r.net in failed], False)
-    save_routes(new)
+    result = change(routes, chosen, plan == "off", gw, table)
+    if result is None:
+        return f"{red('✖')} Пароль не введён — ничего не изменилось"
+    need, failed = result
     done = len(need) - len(failed) if plan == "restore" else sum(r.net not in failed for r in chosen)
     note = {"off": f"{green('✔')} Выключено: {done} {dim('— снова через VPN, в списке остались')}",
             "on": f"{green('✔')} Включено: {done} {dim('— мимо VPN')}",
@@ -250,6 +272,155 @@ def toggle(routes, chosen, gw, table):
     if failed:
         note += f"   {red('✖')} не вышло: {len(failed)} — {next(iter(failed.values()))}"
     return note
+
+
+def check_targets(routes, source, kind):
+    """Адреса для проверки: у сайта — он и его поддомены по системному DNS, у программы — её
+    соединения, и у всех — соединения любых программ с подсетями этой записи (так виден браузер).
+    Возвращает (адреса, соединения программ)."""
+    targets = {}
+    if kind == "site":
+        for ip, name in resolve_system([s + source for s in SUBDOMAINS]).items():
+            targets[ip] = Target(ip, name, "443", name)
+    apps = lsof_connections()
+    if kind == "app":
+        for c in connections_of(source, apps):
+            if ":" not in c.ip:
+                targets.setdefault(c.ip, Target(c.ip, f"{source} :{c.port}", c.port, None))
+    nets = [r.net for r in routes if (r.source, r.kind) == (source, kind)]
+    for app, conns in apps.items():
+        for c in conns:
+            if ":" not in c.ip and any(ipaddress.ip_address(c.ip) in n for n in nets):
+                targets.setdefault(c.ip, Target(c.ip, f"{app} :{c.port}", c.port, None))
+    return sorted(targets.values(), key=lambda t: ipaddress.ip_address(t.ip)), apps
+
+
+def check_row(t, entry, status, verdict):
+    label = dim(t.label[:22].ljust(22))
+    text = {
+        "missing": f"{yellow('!')} {t.ip:<16} {label} {yellow('нет в списке — идёт через VPN')}",
+        "off": f"{dim('○')} {t.ip:<16} {label} {dim('выключен — идёт через VPN')}",
+        "lost": f"{yellow('!')} {t.ip:<16} {label} {yellow('маршрута нет в системе')} {dim('— r в списке, чтобы включить')}",
+        "forced": f"{red('✖')} {t.ip:<16} {label} {red('маршрут есть, но идёт через VPN')}",
+        "dead": f"{red('✖')} {t.ip:<16} {label} {red('мимо VPN не отвечает')} {dim('· ' + str(entry.net if entry else ''))}",
+        "ok": f"{green('✔')} {t.ip:<16} {label} {green('мимо VPN, отвечает')}"
+              f" {dim('· роутер: ' + ROUTER_PATHS.get(verdict, 'путь не определить'))}",
+    }[status]
+    return "  " + text
+
+
+def run_check(source, kind):
+    """Проверяет, как сейчас ходят адреса сайта или программы, и печатает итог. Возвращает записи,
+    подсети которых мимо VPN не ответили, — их можно выключить, чтобы эти адреса шли через VPN."""
+    routes, gw = load_routes(), physical_route()
+    out(f"  {bold('Проверка')} · {cyan(source)} {dim(KINDS[kind])}\n\n")
+    if not gw:
+        out(f"  {red('✖')} Нет подключения к роутеру: мимо VPN сейчас идти не через что.\n")
+        return []
+    live = Live()
+    live.start("собираю адреса…")
+    targets, apps = check_targets(routes, source, kind)
+    me, table = router_address(gw[0]), system_table()
+    live.set(f"ищу шлюз провайдера и проверяю адреса: {len(targets)}…")
+    paths = RouterPaths()
+    try:
+        paths.prepare()
+    except RuntimeError:
+        paths = None
+
+    def inspect(t):
+        """(адрес, запись списка, состояние, куда его шлёт роутер)."""
+        entry = covering(routes, t.ip)
+        if entry is None or entry.off:
+            return t, entry, "missing" if entry is None else "off", None
+        if route_state(entry.net, table, gw[0]) != "on":
+            return t, entry, "lost", None
+        ok, local = probe(t.ip, t.port, t.name)
+        if local and local != me:
+            return t, entry, "forced", None  # маршрут есть, а соединение всё равно ушло в VPN
+        return t, entry, "ok" if ok else "dead", paths.classify(t.ip)[0] if paths and ok else None
+
+    def exits():
+        """[(адрес, где он по базе)] — мимо VPN и через VPN, и куда роутер шлёт сам сервер адресов."""
+        found = [(ip, geo(ip) if ip else None) for ip in (public_ip(gw[1]), public_ip())]
+        try:
+            where = paths.classify(socket.gethostbyname(IP_HOST))[0] if paths else None
+        except OSError:
+            where = None
+        return found, where
+
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        seen = ex.submit(exits)
+        results = list(ex.map(inspect, targets))
+        (bypassed, through_vpn), where = seen.result()
+    live.stop()
+
+    if not targets:
+        out("  " + dim("Не с чем проверить: " + ("сайт не нашёлся в DNS." if kind == "site" else
+                                                  "программа сейчас ничего не открывает — запустите её "
+                                                  "и сделайте в ней что-нибудь.")) + "\n")
+    for row in results:
+        out(check_row(*row) + "\n")
+
+    nets = [r.net for r in routes if (r.source, r.kind) == (source, kind) and not r.off]
+    stale = vpn_connections(apps, nets, me)
+    for app, n in sorted(stale.items()):
+        out(f"\n  {yellow('!')} {bold(app)}: соединений через VPN — {n}. Обычно их открыли до маршрута: открытое"
+            f"\n    {dim('соединение путь не меняет. Перезапустите программу (браузер — целиком, а не вкладку).')}\n")
+
+    if bypassed[0]:
+        how = {"direct": "напрямую провайдеру", "tunnel": "через туннель роутера"}.get(where, "через роутер")
+        out(f"\n  {dim('Мимо VPN (' + how + ') сайты видят адрес')} {bold(bypassed[0])}"
+            + (dim(f" · {bypassed[1]}") if bypassed[1] else "") + "\n")
+    if where == "direct" and any(r[3] == "tunnel" for r in results):
+        out("  " + dim("Адреса, которые роутер шлёт в свой туннель, сайты видят с адреса этого туннеля.") + "\n")
+    if through_vpn[0]:
+        out(f"  {dim('Через VPN — адрес')} {through_vpn[0]}" + (dim(f" · {through_vpn[1]}") if through_vpn[1] else "") + "\n")
+
+    status = lambda s: [r for r in results if r[2] == s]
+    good, forced, missing, lost = status("ok"), status("forced"), status("missing"), status("lost")
+    dead = sorted({r[1] for r in status("dead")}, key=lambda e: e.net)
+    out("\n")
+    if lost:
+        out(f"  {yellow('!')} Части маршрутов нет в системе — так бывает после перезагрузки или смены сети.\n"
+            f"    {dim('Включите их клавишей r в списке маршрутов.')}\n")
+    if forced:
+        out(f"  {red('✖')} Маршруты есть, но система всё равно отправляет эти адреса в VPN. Похоже, VPN-приложение\n"
+            f"    {dim('не даёт себя обходить (kill switch или принудительные маршруты) — с ним обход не сработает.')}\n")
+    if dead:
+        out(f"  {red('✖')} Мимо VPN не ответили подсети: {', '.join(str(e.net) for e in dead)}.\n"
+            f"    {dim('Напрямую их не пропускает провайдер (или пропускает через раз). Выключите их — эти адреса')}\n"
+            f"    {dim('пойдут через VPN, а остальные останутся мимо.')}\n")
+    if missing:
+        out(f"  {yellow('!')} Адреса не из списка идут через VPN. {dim('Добавьте сайт ещё раз — getip допишет их подсети.')}\n")
+    if good and not (forced or dead or missing or lost or stale):
+        out(f"  {green('✔')} Мимо VPN всё работает.\n")
+    if good:
+        out("  " + dim("Сайт видит вас по адресу, с которого пришёл запрос. Если он всё ещё показывает VPN, перезапустите") + "\n"
+            "  " + dim("браузер: соединения, открытые до маршрута, остаются в VPN.") + "\n")
+    return dead
+
+
+def check_flow(source, kind):
+    """Проверка с предложением выключить подсети, которые мимо VPN не отвечают."""
+    dead = run_check(source, kind)
+    if not dead:
+        pause()
+        return
+    out(f"\n  {bold(cyan('o'))} {dim(f'выключить неотвечающие подсети ({len(dead)})')}"
+        f"   {dim('любая другая клавиша — назад')}\n")
+    cursor(False)
+    if read_key() not in ("o", "щ"):
+        return
+    result = change(load_routes(), dead, True, physical_route(), system_table())
+    if result is None:
+        out(f"\n  {red('✖')} Пароль не введён — ничего не изменилось.\n")
+    else:
+        failed = result[1]
+        out(f"\n  {green('✔')} Выключено: {len(dead) - len(failed)} {dim('— эти подсети снова идут через VPN')}\n")
+        for net, err in failed.items():
+            out(f"  {red('✖')} {net}  {dim(err)}\n")
+    pause()
 
 
 def routes_screen():
@@ -282,6 +453,10 @@ def routes_screen():
         elif key in ("a", "ф"):
             every = {route_key(r) for r in routes}
             marked = set() if marked == every else every
+        elif key == "enter":
+            kind, data = rows[index]
+            header()
+            check_flow(*(data[:2] if kind == "group" else (data.source, data.kind)))
         elif key in ("r", "к"):
             # отмеченные, а если ничего не отмечено — строка под курсором
             current = row_keys(rows[index])

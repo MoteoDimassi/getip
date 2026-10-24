@@ -5,12 +5,17 @@ VPN на компьютере забирает себе маршрут по ум
 подсетей getip хранит сам — системные маршруты пропадают после перезагрузки и смены сети,
 а по списку их можно включить заново. Запись можно и выключить, не убирая из списка.
 
+Для проверки здесь же пробное подключение к адресу: по адресу компьютера, с которого ушло
+соединение, видно, пошло оно через роутер или всё-таки в VPN.
+
 Модуль ничего не печатает, а команды выполняет переданная функция run, поэтому всё,
 кроме самого запуска команд, проверяют тесты."""
 import ipaddress
 import json
 import os
 import re
+import socket
+import ssl
 import subprocess
 import sys
 from collections import namedtuple
@@ -213,6 +218,68 @@ def apply(nets, gw, table, run=run_root):
         if not ok:
             failed[net] = err
     return failed
+
+
+def covering(routes, ip):
+    """Запись, в подсеть которой входит ip: включённые важнее выключенных, точные — крупных.
+    None — адреса нет в списке."""
+    addr = ipaddress.ip_address(ip)
+    hits = [r for r in routes if addr in r.net]
+    return min(hits, key=lambda r: (r.off, -r.net.prefixlen)) if hits else None
+
+
+def router_address(gw):
+    """Адрес компьютера в сети роутера (192.168.1.52): с него уходят соединения мимо VPN."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((gw, 9))  # UDP: ничего не отправляется, система только выбирает адрес
+            return s.getsockname()[0]
+    except OSError:
+        return None
+
+
+def probe(ip, port=443, name=None, timeout=5):
+    """Пробное подключение к ip:port. Возвращает (ответил ли, адрес компьютера, с которого
+    ушло соединение, или None). Отказ в подключении — тоже ответ: сервер доступен, порт закрыт.
+    С именем сайта проверяем ещё и HTTPS: провайдеры часто пускают подключение, но обрывают
+    шифрование, увидев в нём имя сайта."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        try:
+            s.connect((ip, int(port)))
+            ok = True
+        except ConnectionRefusedError:
+            ok = True
+        except (OSError, ValueError):
+            ok = False
+        try:
+            local = s.getsockname()[0]
+        except OSError:
+            local = None
+        if ok and name and str(port) == "443":
+            ctx = ssl.create_default_context()
+            ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE  # важен ответ, а не сертификат
+            try:
+                ctx.wrap_socket(s, server_hostname=name).close()
+            except OSError:
+                ok = False
+        return ok, local if local and local != "0.0.0.0" else None
+    finally:
+        s.close()
+
+
+def vpn_connections(apps, nets, router_addr):
+    """{программа: соединений} — соединения с подсетями мимо VPN, которые всё равно идут не через
+    роутер. Обычно их открыли до того, как маршрут включили: открытое соединение путь не меняет."""
+    counts = {}
+    for app, conns in apps.items():
+        for c in conns:
+            if ":" in c.ip or c.local.rpartition(":")[0] == router_addr:
+                continue
+            if any(ipaddress.ip_address(c.ip) in n for n in nets):
+                counts[app] = counts.get(app, 0) + 1
+    return counts
 
 
 def withdraw(nets, table, run=run_root):
