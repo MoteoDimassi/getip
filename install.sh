@@ -19,6 +19,11 @@ say()  { printf "  %b\n" "$*"; }
 fail() { say "${R}✖${N} $*"; exit 1; }
 
 if [ "$1" = "--uninstall" ]; then
+    # иначе постоянные блокировки и фоновая служба останутся без программы, которая их снимет
+    if [ -f /Library/LaunchDaemons/com.getip.blocker.plist ] && [ -x "$BIN/getip" ]; then
+        say "Снимаю блокировки getip (нужен пароль администратора)…"
+        "$BIN/getip" -u all </dev/tty || fail "Не удалось снять блокировки: запустите ${C}getip -u all${N} и повторите удаление"
+    fi
     rm -f "$BIN/getip"
     rm -rf "$DATA"
     rm -rf "$HOME/.config/getip"

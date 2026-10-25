@@ -4,6 +4,8 @@ import os
 import subprocess
 
 from . import VERSION
+from .block import SUPPORTED as BLOCK_SUPPORTED
+from .block_menu import block_menu, entry_hint
 from .bypass_menu import bypass_menu
 from .check import run_check
 from .config import out_dir, save_config
@@ -11,7 +13,7 @@ from .routes import add_to_bat, bat_path, route_lines
 from .scans import ask_site, pick_app, run_scan
 from .style import bold, cyan, dim, green, pretty, red
 from .term import TTY, cursor, header, out, parse_dropped_path, read_key, window
-from .texts import BYPASS_ENTRY, CHECK, MODES, TIPS_COLUMNS, render_tips
+from .texts import BLOCK_ENTRY, BYPASS_ENTRY, CHECK, MODES, TIPS_COLUMNS, render_tips
 from .update import UpdateCheck, self_update
 from .widgets import ask, confirm, menu, pause
 
@@ -189,8 +191,10 @@ def interactive(cfg):
         """Пункты меню: (название, подсказка, действие)."""
         rows = [(label, hint, ("scan", mode)) for mode, (label, hint) in MODES.items()]
         rows += [(*CHECK, ("check", None)),
-                 (*BYPASS_ENTRY, ("bypass", None)),
-                 ("Настройки", "", ("settings", None)),
+                 (*BYPASS_ENTRY, ("bypass", None))]
+        if BLOCK_SUPPORTED:
+            rows.append((BLOCK_ENTRY[0], entry_hint(), ("block", None)))
+        rows += [("Настройки", "", ("settings", None)),
                  ("Открыть папку с файлами", "", ("folder", None))]
         if update.latest:
             rows.append((update_label(), f"сейчас у вас {VERSION}", ("update", None)))
@@ -207,7 +211,7 @@ def interactive(cfg):
         action, arg = entries()[n][2]
         if action == "scan":
             return render_tips(arg)
-        if action in ("check", "bypass"):
+        if action in ("check", "bypass", "block"):
             return render_tips(action)
         if action == "update":
             return (f"  {bold(cyan('Что делает'))}\n    Скачает getip {update.latest} с GitHub и перезапустит"
@@ -232,6 +236,8 @@ def interactive(cfg):
                 check_flow(cfg)
             elif action == "bypass":
                 bypass_menu(cfg)
+            elif action == "block":
+                block_menu(cfg)
             elif action == "settings":
                 settings_menu(cfg)
             elif action == "folder":

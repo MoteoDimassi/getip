@@ -7,7 +7,7 @@
 
 getip 1.3 и старше обновляются, скачивая только этот файл, — поэтому здесь есть
 VERSION (по нему они узнают о новой версии), а без пакета запускалка ставит его сама."""
-VERSION = "2.0.0"  # держите равной src/getip/__init__.py — это проверяет tests/test_version.py
+VERSION = "1.4.0"  # держите равной src/getip/__init__.py — это проверяет tests/test_version.py
 
 import os
 import subprocess

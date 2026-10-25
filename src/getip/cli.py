@@ -7,10 +7,14 @@
   getip -A Claude        отслеживать соединения программы (без DNS и без sudo)
   getip -C Claude        проверить, идёт ли трафик программы через туннель роутера
   getip -b               маршруты мимо VPN: включить, выключить, удалить
+  getip -x youtube.com --for 1h   заблокировать сайт или IP на этом Mac (нужен sudo)
+  getip -u youtube.com   снять блокировку (-u all — снять все), getip --blocks — что заблокировано
 """
 import argparse
+import sys
 
 from . import VERSION
+from .block_menu import block_cli
 from .bypass_menu import routes_screen
 from .check import run_check
 from .config import load_config
@@ -26,7 +30,7 @@ def main():
         prog="getip",
         description="Находит IP-подсети сайта и сохраняет их в <сайт>.bat (route add …). "
                     "Без аргументов открывает меню.")
-    p.add_argument("sites", nargs="*", help="адреса сайтов, напр. claude.ai")
+    p.add_argument("sites", nargs="*", help="адреса сайтов, напр. claude.ai (для -x и -u — также IP)")
     g = p.add_mutually_exclusive_group()
     g.add_argument("-d", "--deep", action="store_true", help="глубокое сканирование")
     g.add_argument("-s", "--sniff", action="store_true", help="слушать DNS-трафик (sudo)")
@@ -36,6 +40,12 @@ def main():
                    help="проверить, идёт ли трафик программы через туннель роутера, напр. -C Claude")
     g.add_argument("-b", "--bypass", action="store_true",
                    help="маршруты мимо VPN: включить, выключить, удалить")
+    g.add_argument("-x", "--block", action="store_true",
+                   help="заблокировать сайты или IP на этом Mac (sudo), напр. -x youtube.com --for 1h")
+    g.add_argument("-u", "--unblock", action="store_true", help="снять блокировку (all — со всех)")
+    g.add_argument("--blocks", action="store_true", help="показать, что сейчас заблокировано")
+    p.add_argument("--for", dest="duration", metavar="СРОК",
+                   help="срок блокировки: 30m, 2h, 1d (по умолчанию — навсегда)")
     p.add_argument("-t", "--time", type=int, help="длительность глубокого сканирования, сек")
     p.add_argument("-a", "--append", action="store_true", help="дополнить существующий .bat")
     p.add_argument("-o", "--out", help="папка для .bat (по умолчанию — текущая)")
@@ -54,6 +64,16 @@ def main():
         except KeyboardInterrupt:
             pass
         out(CLEAR)
+        return
+    if args.block or args.unblock or args.blocks:
+        try:
+            block_cli(args)
+        except RuntimeError as e:
+            out(f"  {red('✖')} {e}\n")
+            sys.exit(1)
+        except KeyboardInterrupt:
+            out("\n")
+            sys.exit(130)
         return
     if not args.sites and not args.app and not args.check:
         if not TTY:
