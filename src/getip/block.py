@@ -224,23 +224,31 @@ def sync_package(src, dst):
             os.remove(os.path.join(dst, name))
 
 
-def install_daemon():
-    os.makedirs(BLOCK_DIR, mode=0o755, exist_ok=True)
-    sync_package(PKG_DIR, HELPER_PKG)
-    # системный Python надёжнее Homebrew: тот при обновлении меняет путь к интерпретатору
-    python = "/usr/bin/python3" if run_quiet(["xcode-select", "-p"]).returncode == 0 else sys.executable
-    plist = plistlib.dumps({"Label": DAEMON, "ProgramArguments": [python, "-m", "getip.block", "--apply"],
-                            "WorkingDirectory": BLOCK_DIR, "RunAtLoad": True, "StartInterval": 30,
-                            "StandardErrorPath": HELPER_LOG})
-    if write_file(PLIST_PATH, plist) or run_quiet(["launchctl", "print", f"system/{DAEMON}"]).returncode:
-        run_quiet(["launchctl", "bootout", f"system/{DAEMON}"])
+def daemon_python():
+    """Python для службы: системный надёжнее Homebrew — тот при обновлении меняет путь к интерпретатору."""
+    return "/usr/bin/python3" if run_quiet(["xcode-select", "-p"]).returncode == 0 else sys.executable
+
+
+def load_daemon(label, path, job):
+    """Записывает plist службы launchd и (пере)запускает её, если plist изменился или служба не запущена."""
+    if write_file(path, plistlib.dumps({"Label": label, **job})) \
+            or run_quiet(["launchctl", "print", f"system/{label}"]).returncode:
+        run_quiet(["launchctl", "bootout", f"system/{label}"])
         for _ in range(5):  # bootout завершается не мгновенно, и bootstrap сразу после него может не пройти
-            r = run_quiet(["launchctl", "bootstrap", "system", PLIST_PATH])
+            r = run_quiet(["launchctl", "bootstrap", "system", path])
             if r.returncode == 0:
                 break
             time.sleep(0.5)
         else:
             raise RuntimeError("не удалось запустить службу getip: " + r.stderr.strip()[-200:])
+
+
+def install_daemon():
+    os.makedirs(BLOCK_DIR, mode=0o755, exist_ok=True)
+    sync_package(PKG_DIR, HELPER_PKG)
+    load_daemon(DAEMON, PLIST_PATH, {"ProgramArguments": [daemon_python(), "-m", "getip.block", "--apply"],
+                                     "WorkingDirectory": BLOCK_DIR, "RunAtLoad": True, "StartInterval": 30,
+                                     "StandardErrorPath": HELPER_LOG})
 
 
 def uninstall_daemon():

@@ -24,6 +24,12 @@ if [ "$1" = "--uninstall" ]; then
         say "Снимаю блокировки getip (нужен пароль администратора)…"
         "$BIN/getip" -u all </dev/tty || fail "Не удалось снять блокировки: запустите ${C}getip -u all${N} и повторите удаление"
     fi
+    # служба «Мимо VPN» без getip так и держала бы маршруты — убираем их вместе с ней
+    if [ -f /Library/LaunchDaemons/com.getip.bypass.plist ] && [ -d "$DATA/getip" ]; then
+        say "Убираю маршруты мимо VPN (нужен пароль администратора)…"
+        (cd "$DATA" && sudo python3 -m getip.bypass_service --set '[]' </dev/tty) \
+            || fail "Не удалось убрать маршруты мимо VPN: остановите службы в настройках getip и повторите удаление"
+    fi
     rm -f "$BIN/getip"
     rm -rf "$DATA"
     rm -rf "$HOME/.config/getip"

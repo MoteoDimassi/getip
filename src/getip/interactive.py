@@ -3,19 +3,21 @@ import ipaddress
 import os
 import subprocess
 
-from . import VERSION
-from .block import SUPPORTED as BLOCK_SUPPORTED
+from . import VERSION, bypass_service
+from .block import PLIST_PATH as BLOCK_PLIST, SUPPORTED as BLOCK_SUPPORTED, active_blocks, block_admin, load_blocks
 from .block_menu import block_menu, entry_hint
 from .bypass_menu import bypass_menu
 from .check import run_check
 from .config import out_dir, save_config
 from .routes import add_to_bat, bat_path, route_lines
 from .scans import ask_site, pick_app, run_scan
-from .style import bold, cyan, dim, green, pretty, red
+from .style import bold, cyan, dim, green, pretty, red, yellow
 from .term import TTY, cursor, header, out, parse_dropped_path, read_key, window
 from .texts import BLOCK_ENTRY, BYPASS_ENTRY, CHECK, MODES, TIPS_COLUMNS, render_tips
 from .update import UpdateCheck, self_update
-from .widgets import ask, confirm, menu, pause
+from .widgets import ask, confirm, get_sudo, menu, pause
+
+SERVICES_TITLE = "Фоновые службы"
 
 
 def show_file(path):
@@ -93,6 +95,60 @@ def drop_folder(cfg, text):
     return f"{green('✔')} Файлы теперь сохраняются в {bold(pretty(path))}"
 
 
+def running_services():
+    """[(название, как нагружает Mac, что изменится после остановки, остановка)] — фоновые службы
+    getip, которые сейчас работают. Остановка возвращает ошибку или None."""
+    def stop_blocker():
+        try:
+            block_admin({"remove": [b["id"] for b in load_blocks()["blocks"]]})
+        except RuntimeError as e:
+            return str(e)
+        return None
+
+    found = []
+    if os.path.exists(BLOCK_PLIST):
+        n = len(active_blocks(load_blocks()))
+        found.append(("Блокировка", "проверяет блокировки раз в 30 сек",
+                      f"Снимутся все блокировки ({n}): заблокированные сайты и IP снова откроются.", stop_blocker))
+    if bypass_service.running():
+        n = len(bypass_service.load_nets())
+        found.append(("Мимо VPN", f"проверяет маршруты раз в {bypass_service.INTERVAL} сек и при смене сети",
+                      f"Маршруты мимо VPN ({n}) уберутся из системы: эти сайты и программы пойдут через VPN.\n"
+                      "В списке они останутся выключенными — r в «Маршруты мимо VPN» включит их и службу снова.",
+                      bypass_service.stop))
+    return found
+
+
+def services_hint():
+    names = [name[0].lower() + name[1:] for name, *_ in running_services()]  # «мимо VPN», а не «мимо vpn»
+    return ("работают: " + ", ".join(names)) if names else dim("не запущены")
+
+
+def stop_services_flow():
+    """Останавливает все фоновые службы getip, предупредив, что перестанет работать."""
+    found = running_services()
+    if not found:
+        header(SERVICES_TITLE)
+        out("  " + dim("Фоновые службы getip сейчас не запущены — Mac они не нагружают.") + "\n")
+        pause()
+        return
+    body = "  " + dim("Сейчас работают — каждая запускается от имени системы, даже когда getip закрыт:") + "\n"
+    for name, load, effect, _ in found:
+        body += f"\n    {bold(name)} {dim('· ' + load)}\n"
+        body += "".join(f"    {yellow('!') if i == 0 else ' '} {line}\n" for i, line in enumerate(effect.split("\n")))
+    if not confirm("Остановить фоновые службы getip?", "Да, остановить", "Нет, оставить", body=body):
+        return
+    header(SERVICES_TITLE)
+    if not get_sudo("Нужен пароль администратора: службы getip работают от имени системы."):
+        out(f"\n  {red('✖')} Пароль не введён — службы работают как прежде.\n")
+        pause()
+        return
+    for name, _, _, stop in found:
+        err = stop()
+        out(f"  {red('✖')} {name}: {err}\n" if err else f"  {green('✔')} {name} — служба остановлена\n")
+    pause()
+
+
 def settings_menu(cfg):
     on = lambda v: green("вкл") if v else dim("выкл")
     items = lambda: [
@@ -102,13 +158,14 @@ def settings_menu(cfg):
         ("Папка для файлов", pretty(cfg["out_dir"]) if cfg["out_dir"] else "текущая папка терминала"),
         ("Глубокое сканирование", f"{cfg['deep_seconds']} сек"),
         ("Подгонять размер окна", on(cfg["fit_window"]) + dim("  увеличивать окно, чтобы подсказки помещались")),
+        ("Остановить фоновые службы", services_hint()),
         ("Назад", ""),
     ]
     index = 0
     while True:
         index = menu("Настройки", items, index=index, on_paste=lambda t: drop_folder(cfg, t),
                      body="  " + dim("Совет: перетащите папку в это окно, чтобы сохранять файлы туда."))
-        if index is None or index == 6:
+        if index is None or index == 7:
             return
         if index == 0:
             v = ask("Шлюз (IP)", cfg["gw"])
@@ -143,6 +200,8 @@ def settings_menu(cfg):
             if not cfg["fit_window"]:
                 window.restore()  # выключили — сразу возвращаем окну прежний размер
             window.enabled, window.ignored = cfg["fit_window"], False
+        elif index == 6:
+            stop_services_flow()
         save_config(cfg)
 
 

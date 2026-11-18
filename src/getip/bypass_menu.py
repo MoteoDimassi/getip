@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from .bypass import (KINDS, add_routes, apply, covering, group_routes, load_routes, probe, remove_routes,
                      route_key, route_state, router_address, save_routes, switch, system_table, to_add,
                      to_delete, toggle_plan, vpn_connections, withdraw)
+from .bypass_service import needs_update, publish, running, service_nets
 from .connections import connections_of, lsof_connections
 from .lookup import IP_HOST, geo, public_ip, resolve_system
 from .scans import SUBDOMAINS, ask_site, collect, pick_app
@@ -63,6 +64,33 @@ def chosen_text(chosen):
     return "\n".join(lines)
 
 
+def service_warning(routes):
+    """Передаёт службе включённые подсети (пароль уже введён). Возвращает предупреждение, если служба
+    не обновилась, пояснение, если она только что появилась, иначе пустую строку."""
+    first = not running()
+    err = publish(routes)
+    if err:
+        return f"{yellow('!')} Служба getip не обновилась: {err} {dim('— после смены сети маршруты сломаются')}"
+    if first and running():
+        return dim("macOS может сообщить о новом фоновом объекте — это служба getip: она переводит маршруты "
+                   "на роутер новой сети")
+    return ""
+
+
+def joined(note, warning):
+    return note + (f"   {warning}" if warning else "")
+
+
+def service_line(routes):
+    """Строка экрана списка, если служба не знает о включённых подсетях."""
+    if not needs_update(routes):
+        return ""
+    if service_nets(routes):
+        return (f"  {yellow('!')} Маршруты не переедут на новый роутер при смене сети и пропадут после перезагрузки"
+                f" {dim('— s, чтобы включить службу getip')}\n")
+    return f"  {yellow('!')} Служба getip держит маршруты, которых нет в списке {dim('— s, чтобы убрать их')}\n"
+
+
 def offer(target, kind, nets):
     """После сбора адресов: показывает новые подсети и по согласию пускает их мимо VPN."""
     if not nets:
@@ -82,6 +110,8 @@ def offer(target, kind, nets):
     if not need:
         save_routes(routes)
         out(f"\n  {green('✔')} {bold(target)} уже идёт мимо VPN: все найденные подсети в списке и действуют.\n")
+        if needs_update(routes) and get_sudo(SUDO_REASON):
+            out(f"  {service_warning(routes) or green('✔') + ' Служба getip следит за маршрутами'}\n")
         pause()
         return
 
@@ -104,12 +134,15 @@ def offer(target, kind, nets):
         return
     failed = apply(need, gw[0], table)
     save_routes(routes)
+    warning = service_warning(routes)
     if len(need) > len(failed):
         out(f"\n  {green('✔')} {bold(target)} идёт мимо VPN · подсетей через роутер: {len(need) - len(failed)}\n")
     for net, err in failed.items():
         out(f"  {red('✖')} {net}  {dim(err)}\n")
     if failed:
         out("    " + dim("Эти подсети остались в списке — включите их клавишей r в «Маршруты мимо VPN».") + "\n")
+    if warning:
+        out(f"  {warning}\n")
     out("\n")
     check_flow(target, kind)
 
@@ -162,7 +195,8 @@ def state_text(r, table, gw, others):
     if state == "on":
         return green("✔ мимо VPN") + also
     if state == "stale":
-        return yellow(f"! через шлюз прежней сети {table[r.net]}") + dim(" — r, чтобы включить") + also
+        return (red(f"✖ ведёт на роутер прежней сети {table[r.net]}: сайты из неё не открываются")
+                + dim(" — r, чтобы исправить") + also)
     return yellow("! не действует") + dim(" — r, чтобы включить") + also
 
 
@@ -195,7 +229,7 @@ def draw_list(routes, rows, marked, index, notice, gw, table):
         if len(enabled) > on and gw:
             top += (f"  {yellow('!')} Не действуют после перезагрузки или смены сети: {len(enabled) - on}"
                     f" {dim('— a, затем r, чтобы вернуть')}\n")
-    top += "\n"
+    top += service_line(routes) + "\n"
     keys = LIST_KEYS if routes else ("← — назад",)
     bottom = "\n" + (f"  {notice}\n" if notice else "") + "\n".join("  " + dim(k) for k in keys)
     if not routes:
@@ -223,26 +257,28 @@ def delete(routes, chosen, title, text):
     """Удаляет выбранные записи, если пользователь подтвердит. Возвращает строку-уведомление."""
     if not confirm(title, "Да, удалить", "Нет, оставить", body=f"  {dim(text)}\n{chosen_text(chosen)}"):
         return dim("Ничего не удалено")
-    _, gone = remove_routes(routes, chosen)
+    left, gone = remove_routes(routes, chosen)
     table = system_table()
-    if to_delete(gone, table) and not get_sudo(SUDO_REASON):
+    if (to_delete(gone, table) or needs_update(left)) and not get_sudo(SUDO_REASON):
         return f"{red('✖')} Пароль не введён — ничего не удалено"
     failed = withdraw(gone, table)
     # маршрут, который не удалось убрать из системы, оставляем и в списке — иначе его не найти
     removed = [r for r in chosen if r.net not in failed]
-    save_routes(remove_routes(routes, removed)[0])
+    left = remove_routes(routes, removed)[0]
+    save_routes(left)
     note = f"{green('✔')} Удалено из списка: {len(removed)}"
     if failed:
         note += f"   {red('✖')} не удалось убрать из системы: {len(failed)} — {next(iter(failed.values()))}"
-    return note
+    return joined(note, service_warning(left))
 
 
 def change(routes, chosen, off, gw, table):
     """Выключает (off=True) или включает записи вместе с их маршрутами в системе и сохраняет список.
-    Возвращает (подсети, которые меняли в системе, {подсеть: ошибка}) или None, если пароль не ввели."""
+    Возвращает (подсети, которые меняли в системе, {подсеть: ошибка}, предупреждение о службе)
+    или None, если пароль не ввели."""
     new, nets = switch(routes, chosen, off)
     need = to_delete(nets, table) if off else to_add(nets, table, gw[0])
-    if need:
+    if need or needs_update(new):
         out("\n")
         if not get_sudo(SUDO_REASON):
             return None
@@ -250,7 +286,7 @@ def change(routes, chosen, off, gw, table):
     if off and failed:  # маршрут остался в системе — пусть и запись остаётся включённой
         new, _ = switch(new, [r for r in chosen if r.net in failed], False)
     save_routes(new)
-    return need, failed
+    return need, failed, service_warning(new)
 
 
 def toggle(routes, chosen, gw, table):
@@ -264,14 +300,14 @@ def toggle(routes, chosen, gw, table):
     result = change(routes, chosen, plan == "off", gw, table)
     if result is None:
         return f"{red('✖')} Пароль не введён — ничего не изменилось"
-    need, failed = result
+    need, failed, warning = result
     done = len(need) - len(failed) if plan == "restore" else sum(r.net not in failed for r in chosen)
     note = {"off": f"{green('✔')} Выключено: {done} {dim('— снова через VPN, в списке остались')}",
             "on": f"{green('✔')} Включено: {done} {dim('— мимо VPN')}",
             "restore": f"{green('✔')} Возвращено в систему: {done}"}[plan]
     if failed:
         note += f"   {red('✖')} не вышло: {len(failed)} — {next(iter(failed.values()))}"
-    return note
+    return joined(note, warning)
 
 
 def check_targets(routes, source, kind):
@@ -420,6 +456,8 @@ def check_flow(source, kind):
         out(f"\n  {green('✔')} Выключено: {len(dead) - len(failed)} {dim('— эти подсети снова идут через VPN')}\n")
         for net, err in failed.items():
             out(f"  {red('✖')} {net}  {dim(err)}\n")
+        if result[2]:
+            out(f"  {result[2]}\n")
     pause()
 
 
@@ -440,6 +478,14 @@ def routes_screen():
         if key in ("q", "esc", "left"):
             out("\r\033[K")
             return
+        if key in ("s", "ы") and needs_update(routes):
+            out("\n")
+            if not get_sudo(SUDO_REASON):
+                notice = f"{red('✖')} Пароль не введён — ничего не изменилось"
+            else:
+                notice = service_warning(routes) or (f"{green('✔')} Служба getip следит за маршрутами"
+                                                     if service_nets(routes) else f"{green('✔')} Служба getip остановлена")
+            continue
         if not rows:
             continue
         chosen = [r for r in routes if route_key(r) in marked]
